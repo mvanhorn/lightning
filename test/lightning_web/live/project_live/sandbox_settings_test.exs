@@ -57,6 +57,15 @@ defmodule LightningWeb.ProjectLive.SandboxSettingsTest do
       assert html =~ "Delete project"
     end
 
+    test "retains the project deletion flow", %{conn: conn, parent: parent} do
+      {:ok, view, html} =
+        live(conn, ~p"/projects/#{parent.id}/settings/delete")
+
+      assert html =~ "Enter the project name to confirm deletion"
+      assert has_element?(view, "#scheduled_deletion_form")
+      refute has_element?(view, "#confirm-delete-sandbox")
+    end
+
     test "shows webhook auth methods table on webhook_security tab", %{
       conn: conn,
       parent: parent
@@ -124,7 +133,7 @@ defmodule LightningWeb.ProjectLive.SandboxSettingsTest do
       refute html =~ "Delete project"
     end
 
-    test "delete sandbox flow calls delete_sandbox and redirects to root project",
+    test "delete sandbox flow schedules deletion and redirects to root project",
          %{conn: conn, sandbox: sandbox, parent: parent} do
       {:ok, view, _html} =
         live(conn, ~p"/projects/#{sandbox.id}/settings/delete")
@@ -136,8 +145,69 @@ defmodule LightningWeb.ProjectLive.SandboxSettingsTest do
       |> render_submit()
 
       flash = assert_redirected(view, ~p"/projects/#{parent.id}/w")
-      assert flash["info"] =~ "and all its associated descendants deleted"
-      assert is_nil(Lightning.Projects.get_project(sandbox.id))
+      assert flash["info"] == "Sandbox #{sandbox.name} scheduled for deletion."
+
+      persisted_sandbox = Lightning.Projects.get_project(sandbox.id)
+      assert %DateTime{} = persisted_sandbox.scheduled_deletion
+    end
+
+    test "shows active descendants and schedules the whole sandbox subtree",
+         %{conn: conn, sandbox: sandbox, user: user, parent: parent} do
+      child =
+        insert(:project,
+          name: "child-sandbox",
+          parent: sandbox,
+          project_users: [%{user: user, role: :owner}]
+        )
+
+      grandchild =
+        insert(:project,
+          name: "grandchild-sandbox",
+          parent: child,
+          project_users: [%{user: user, role: :owner}]
+        )
+
+      {:ok, view, html} =
+        live(conn, ~p"/projects/#{sandbox.id}/settings/delete")
+
+      assert html =~ "Its 2 child sandboxes will also be deleted."
+
+      view
+      |> form("#confirm-delete-sandbox form",
+        confirm: %{name: sandbox.name}
+      )
+      |> render_submit()
+
+      assert_redirected(view, ~p"/projects/#{parent.id}/w")
+
+      for project <- [sandbox, child, grandchild] do
+        assert %DateTime{} =
+                 Lightning.Projects.get_project(project.id).scheduled_deletion
+      end
+    end
+
+    test "excludes descendants already scheduled for deletion from the warning",
+         %{conn: conn, sandbox: sandbox, user: user} do
+      _active_child =
+        insert(:project,
+          name: "active-child",
+          parent: sandbox,
+          project_users: [%{user: user, role: :owner}]
+        )
+
+      _scheduled_child =
+        insert(:project,
+          name: "scheduled-child",
+          parent: sandbox,
+          scheduled_deletion: DateTime.utc_now() |> DateTime.truncate(:second),
+          project_users: [%{user: user, role: :owner}]
+        )
+
+      {:ok, _view, html} =
+        live(conn, ~p"/projects/#{sandbox.id}/settings/delete")
+
+      assert html =~ "Its child sandbox will also be deleted."
+      refute html =~ "Its 2 child sandboxes will also be deleted."
     end
 
     test "confirm-delete-validate marks the form invalid for a wrong name",
@@ -152,7 +222,7 @@ defmodule LightningWeb.ProjectLive.SandboxSettingsTest do
 
       assert html =~ "does not match the sandbox name"
       # Sandbox was not deleted
-      assert Lightning.Projects.get_project(sandbox.id)
+      assert is_nil(Lightning.Projects.get_project(sandbox.id).scheduled_deletion)
     end
 
     test "submitting the confirm form with a wrong name does not delete and re-renders errors",
@@ -166,7 +236,7 @@ defmodule LightningWeb.ProjectLive.SandboxSettingsTest do
         |> render_submit()
 
       assert html =~ "does not match the sandbox name"
-      assert Lightning.Projects.get_project(sandbox.id)
+      assert is_nil(Lightning.Projects.get_project(sandbox.id).scheduled_deletion)
     end
 
     test "close button navigates back to the settings index",
@@ -186,12 +256,14 @@ defmodule LightningWeb.ProjectLive.SandboxSettingsTest do
       {:ok, view, _html} =
         live(conn, ~p"/projects/#{sandbox.id}/settings/delete")
 
-      # Simulate an authorization mismatch by stubbing the sandbox delete call
+      # Simulate an authorization mismatch by stubbing the sandbox scheduling call
       # to return :unauthorized while the settings page's own can_delete_project
       # gate allowed us through.
-      Mimic.expect(Lightning.Projects.Sandboxes, :delete_sandbox, fn _, _ ->
-        {:error, :unauthorized}
-      end)
+      Mimic.expect(
+        Lightning.Projects.Sandboxes,
+        :schedule_sandbox_deletion,
+        fn _, _ -> {:error, :unauthorized} end
+      )
 
       view
       |> form("#confirm-delete-sandbox form",
@@ -201,7 +273,7 @@ defmodule LightningWeb.ProjectLive.SandboxSettingsTest do
 
       flash = assert_redirected(view, ~p"/projects/#{sandbox.id}/settings")
       assert flash["error"] =~ "permission to delete this sandbox"
-      assert Lightning.Projects.get_project(sandbox.id)
+      assert is_nil(Lightning.Projects.get_project(sandbox.id).scheduled_deletion)
     end
 
     test "unexpected sandbox delete error surfaces a generic error",
@@ -209,9 +281,11 @@ defmodule LightningWeb.ProjectLive.SandboxSettingsTest do
       {:ok, view, _html} =
         live(conn, ~p"/projects/#{sandbox.id}/settings/delete")
 
-      Mimic.expect(Lightning.Projects.Sandboxes, :delete_sandbox, fn _, _ ->
-        {:error, :boom}
-      end)
+      Mimic.expect(
+        Lightning.Projects.Sandboxes,
+        :schedule_sandbox_deletion,
+        fn _, _ -> {:error, :boom} end
+      )
 
       view
       |> form("#confirm-delete-sandbox form",
@@ -221,7 +295,7 @@ defmodule LightningWeb.ProjectLive.SandboxSettingsTest do
 
       flash = assert_redirected(view, ~p"/projects/#{sandbox.id}/settings")
       assert flash["error"] =~ "Could not delete sandbox"
-      assert Lightning.Projects.get_project(sandbox.id)
+      assert is_nil(Lightning.Projects.get_project(sandbox.id).scheduled_deletion)
     end
 
     test "shows webhook security explanatory message instead of auth methods",

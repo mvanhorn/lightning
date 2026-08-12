@@ -52,6 +52,11 @@ and this project adheres to
 
 ### Fixed
 
+- Deleting a sandbox from project settings now schedules its subtree for
+  deletion with the configured recovery window instead of removing it
+  immediately, and the confirmation warns about active child sandboxes.
+  [#5058](https://github.com/OpenFn/lightning/issues/5058)
+
 - `APOLLO_TIMEOUT` now governs every request to Apollo, including the streaming
   requests all AI chats use. Streaming previously read an internal timeout key
   that no environment could set, so it was always 120s regardless of
