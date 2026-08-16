@@ -4784,6 +4784,87 @@ defmodule LightningWeb.ProjectLiveTest do
       refute html =~ "No GitHub installations found"
     end
 
+    test "refreshes an early-rejected OAuth token and enables installations", %{
+      conn: conn
+    } do
+      project = insert(:project)
+      {conn, user} = setup_project_user(conn, project, :admin)
+      set_valid_github_oauth_token!(user)
+
+      installation = %{
+        "id" => 1234,
+        "account" => %{"type" => "User", "login" => "username"}
+      }
+
+      Mox.expect(Lightning.Tesla.Mock, :call, 3, fn
+        %{url: "https://api.github.com/user/installations"} = env, _opts ->
+          case Tesla.get_header(env, "authorization") do
+            "Bearer access-token" ->
+              {:ok,
+               %Tesla.Env{
+                 status: 401,
+                 body: %{"message" => "Bad credentials"}
+               }}
+
+            "Bearer refreshed-access-token" ->
+              {:ok,
+               %Tesla.Env{
+                 status: 200,
+                 body: %{"installations" => [installation]}
+               }}
+          end
+
+        %{url: "https://github.com/login/oauth/access_token"}, _opts ->
+          {:ok,
+           %Tesla.Env{
+             body: %{
+               "access_token" => "refreshed-access-token",
+               "refresh_token" => "refreshed-refresh-token",
+               "expires_in" => 3600,
+               "refresh_token_expires_in" => 7200
+             }
+           }}
+      end)
+
+      expect_create_installation_token(installation["id"])
+      expect_get_installation_repos(200)
+
+      {:ok, view, _html} =
+        live(conn, ~p"/projects/#{project.id}/settings#vcs")
+
+      html = render_async(view)
+
+      assert html =~ "User: username"
+      refute html =~ "Unable to load GitHub installations"
+      refute has_element?(view, "button[aria-haspopup=listbox][disabled]")
+    end
+
+    test "shows reconnect guidance when a rejected token cannot be refreshed", %{
+      conn: conn
+    } do
+      project = insert(:project)
+      {conn, user} = setup_project_user(conn, project, :admin)
+      set_valid_github_oauth_token!(user)
+
+      Mox.expect(Lightning.Tesla.Mock, :call, 2, fn
+        %{url: "https://api.github.com/user/installations"}, _opts ->
+          {:ok, %Tesla.Env{status: 401, body: %{"message" => "Bad credentials"}}}
+
+        %{url: "https://github.com/login/oauth/access_token"}, _opts ->
+          {:ok, %Tesla.Env{body: %{"error" => "bad_refresh_token"}}}
+      end)
+
+      {:ok, view, _html} =
+        live(conn, ~p"/projects/#{project.id}/settings#vcs")
+
+      html = render_async(view)
+
+      assert html =~ "Your GitHub authentication has expired or is invalid"
+      assert html =~ "reconnect your GitHub account"
+      refute html =~ "There was a problem connecting to GitHub"
+      assert has_element?(view, "button[aria-haspopup=listbox][disabled]")
+    end
+
     test "shows warning banner when user has no GitHub installations", %{
       conn: conn
     } do

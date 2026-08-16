@@ -8,6 +8,8 @@ defmodule Lightning.VersionControlTest do
   alias Lightning.Extensions.UsageLimiting.Context
   alias Lightning.Repo
   alias Lightning.VersionControl
+  alias Lightning.VersionControl.Events
+  alias Lightning.VersionControl.GithubError
   alias Lightning.VersionControl.ProjectRepoConnection
   alias Lightning.Workflows.Snapshot
 
@@ -509,6 +511,103 @@ defmodule Lightning.VersionControlTest do
 
       assert updated_user.github_oauth_token["access_token"] ==
                expected_access_token
+    end
+  end
+
+  describe "fetch_user_installations/1" do
+    test "refreshes and persists an access token rejected by GitHub, then retries once" do
+      user = user_with_valid_github_oauth()
+      :ok = Events.subscribe(user)
+
+      refreshed_token = %{
+        "access_token" => "refreshed-access-token",
+        "refresh_token" => "refreshed-refresh-token",
+        "expires_in" => 3600,
+        "refresh_token_expires_in" => 7200
+      }
+
+      installations = %{"installations" => [%{"id" => 1234}]}
+
+      Mox.expect(Lightning.Tesla.Mock, :call, 3, fn
+        %{url: "https://api.github.com/user/installations"} = env, _opts ->
+          case Tesla.get_header(env, "authorization") do
+            "Bearer access-token" ->
+              {:ok,
+               %Tesla.Env{
+                 status: 401,
+                 body: %{"message" => "Bad credentials"}
+               }}
+
+            "Bearer refreshed-access-token" ->
+              {:ok, %Tesla.Env{status: 200, body: installations}}
+          end
+
+        %{url: "https://github.com/login/oauth/access_token"}, _opts ->
+          {:ok, %Tesla.Env{body: refreshed_token}}
+      end)
+
+      assert {:ok, ^installations} =
+               VersionControl.fetch_user_installations(user)
+
+      assert Repo.reload!(user).github_oauth_token["access_token"] ==
+               "refreshed-access-token"
+
+      refute_receive %Events.OauthTokenAdded{}
+    end
+
+    test "returns an invalid OAuth token error when refresh fails" do
+      user = user_with_valid_github_oauth()
+
+      Mox.expect(Lightning.Tesla.Mock, :call, 2, fn
+        %{url: "https://api.github.com/user/installations"}, _opts ->
+          {:ok, %Tesla.Env{status: 401, body: %{"message" => "Bad credentials"}}}
+
+        %{url: "https://github.com/login/oauth/access_token"}, _opts ->
+          {:ok, %Tesla.Env{body: %{"error" => "bad_refresh_token"}}}
+      end)
+
+      assert {:error, %GithubError{code: :invalid_oauth_token}} =
+               VersionControl.fetch_user_installations(user)
+    end
+
+    test "returns an invalid OAuth token error when no refresh token is available" do
+      user =
+        insert(:user, github_oauth_token: %{"access_token" => "access-token"})
+
+      expect_get_user_installations(401, %{"message" => "Bad credentials"})
+
+      assert {:error, %GithubError{code: :invalid_oauth_token}} =
+               VersionControl.fetch_user_installations(user)
+    end
+
+    test "returns an invalid OAuth token error after one rejected retry" do
+      user = user_with_valid_github_oauth()
+
+      Mox.expect(Lightning.Tesla.Mock, :call, 3, fn
+        %{url: "https://api.github.com/user/installations"}, _opts ->
+          {:ok, %Tesla.Env{status: 401, body: %{"message" => "Bad credentials"}}}
+
+        %{url: "https://github.com/login/oauth/access_token"}, _opts ->
+          {:ok,
+           %Tesla.Env{
+             body: %{
+               "access_token" => "refreshed-access-token",
+               "refresh_token" => "refreshed-refresh-token"
+             }
+           }}
+      end)
+
+      assert {:error, %GithubError{code: :invalid_oauth_token}} =
+               VersionControl.fetch_user_installations(user)
+    end
+
+    test "returns non-authentication API errors without refreshing" do
+      user = user_with_valid_github_oauth()
+      error = %{"error" => "Internal Server Error"}
+
+      expect_get_user_installations(500, error)
+
+      assert {:error, ^error} = VersionControl.fetch_user_installations(user)
     end
   end
 

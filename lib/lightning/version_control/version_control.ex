@@ -194,16 +194,55 @@ defmodule Lightning.VersionControl do
   end
 
   def fetch_user_installations(user) do
-    with {:ok, access_token} <- fetch_user_access_token(user),
-         {:ok, client} <- GithubClient.build_bearer_client(access_token) do
-      case GithubClient.get_installations(client) do
-        {:ok, %{body: body}} ->
-          {:ok, body}
+    with {:ok, access_token} <- fetch_user_access_token(user) do
+      case request_user_installations(access_token) do
+        {:error, :unauthorized} ->
+          refresh_and_retry_user_installations(user)
 
-        {:error, %{body: body}} ->
-          {:error, body}
+        result ->
+          result
       end
     end
+  end
+
+  defp refresh_and_retry_user_installations(user) do
+    with {:ok, access_token} <- refresh_rejected_access_token(user) do
+      case request_user_installations(access_token) do
+        {:error, :unauthorized} -> invalid_oauth_token_error()
+        result -> result
+      end
+    else
+      {:error, _reason} -> invalid_oauth_token_error()
+    end
+  end
+
+  defp refresh_rejected_access_token(
+         %User{
+           github_oauth_token: %{"refresh_token" => refresh_token}
+         } = user
+       )
+       when is_binary(refresh_token) do
+    with {:ok, refreshed_token} <- refresh_oauth_token(refresh_token),
+         {:ok, _user} <- save_oauth_token(user, refreshed_token, notify: false) do
+      {:ok, refreshed_token["access_token"]}
+    end
+  end
+
+  defp refresh_rejected_access_token(_user), do: {:error, :missing_refresh_token}
+
+  defp request_user_installations(access_token) do
+    with {:ok, client} <- GithubClient.build_bearer_client(access_token) do
+      case GithubClient.get_installations(client) do
+        {:ok, %{body: body}} -> {:ok, body}
+        {:error, %{status: 401}} -> {:error, :unauthorized}
+        {:error, %{body: body}} -> {:error, body}
+      end
+    end
+  end
+
+  defp invalid_oauth_token_error do
+    {:error,
+     GithubError.invalid_oauth_token("GitHub rejected the user's OAuth token")}
   end
 
   def fetch_installation_repos(installation_id) do
